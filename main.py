@@ -95,9 +95,10 @@ else:
     logger.warning("Memcached is not available. Using in-memory storage for rate limiting. Not-Recommended")
 
 
-ONE_MIN_API_URL = "https://api.1min.ai/api/features"
+ONE_MIN_CHAT_API_URL = "https://api.1min.ai/api/chat-with-ai"
+ONE_MIN_CHAT_API_STREAMING_URL = "https://api.1min.ai/api/chat-with-ai?isStreaming=true"
+ONE_MIN_FEATURES_API_URL = "https://api.1min.ai/api/features"
 ONE_MIN_CONVERSATION_API_URL = "https://api.1min.ai/api/conversations"
-ONE_MIN_CONVERSATION_API_STREAMING_URL = "https://api.1min.ai/api/features?isStreaming=true"
 ONE_MIN_ASSET_URL = "https://api.1min.ai/api/assets"
 
 # Define the models that are available for use
@@ -158,10 +159,10 @@ image_generation_models = [
     "midjourney",
     "midjourney_6_1",
     # Learnardo
-    "6b645e3a-d64f-4341-a6d8-7a3690fbf042" # LEONARDO_PHOENIX
-    "b24e16ff-06e3-43eb-8d33-4416c2d75876" # LEONARDO_LIGHTNING_XL
-    "e71a1c2f-4f80-4800-934f-2c68979d8cc8" # LEONARDO_ANIME_XL
-    "1e60896f-3c26-4296-8ecc-53e2afecc132" # LEONARDO_DIFFUSION_XL
+    "6b645e3a-d64f-4341-a6d8-7a3690fbf042", # LEONARDO_PHOENIX
+    "b24e16ff-06e3-43eb-8d33-4416c2d75876", # LEONARDO_LIGHTNING_XL
+    "e71a1c2f-4f80-4800-934f-2c68979d8cc8", # LEONARDO_ANIME_XL
+    "1e60896f-3c26-4296-8ecc-53e2afecc132", # LEONARDO_DIFFUSION_XL
     "aa77f04e-3eec-4034-9c07-d0f619684628" # LEONARDO_KINO_XL
     "2067ae52-33fd-4a82-bb92-c2c55e7d2786" # LEONARDO_ALBEDO_BASE_XL
     "black-forest-labs/flux-schnell",
@@ -232,36 +233,7 @@ def ERROR_HANDLER(code, model=None, key=None):
     logger.error(f"An error has occurred while processing the user's request. Error code: {code}")
     return jsonify({"error": error_data}), error_codes.get(code, {}).get("http_code", 400) # Return the error data without http_code inside the payload and get the http_code to return.
 
-def format_conversation_history(messages, new_input):
-    """
-    Formats the conversation history into a structured string.
-    
-    Args:
-        messages (list): List of message dictionaries from the request
-        new_input (str): The new user input message
-    
-    Returns:
-        str: Formatted conversation history
-    """
-    formatted_history = ["Conversation History:\n"]
-    
-    for message in messages:
-        role = message.get('role', '').capitalize()
-        content = message.get('content', '')
-        
-        # Handle potential list content
-        if isinstance(content, list):
-            content = '\n'.join(item['text'] for item in content if 'text' in item)
-        
-        formatted_history.append(f"{role}: {content}")
-    
-    # Append additional messages only if there are existing messages
-    if messages: # Save credits if it is the first message.
-        formatted_history.append("Respond like normal. The conversation history will be automatically updated on the next MESSAGE. DO NOT ADD User: or Assistant: to your output. Just respond like normal.")
-        formatted_history.append("User Message:\n")
-    formatted_history.append(new_input) 
-    
-    return '\n'.join(formatted_history)
+
 
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
@@ -285,8 +257,6 @@ def conversation():
     
     request_data = request.json
     
-    all_messages = format_conversation_history(request_data.get('messages', []), request_data.get('new_input', ''))
-
     messages = request_data.get('messages', [])
     if not messages:
         return ERROR_HANDLER(1412)
@@ -295,13 +265,13 @@ def conversation():
     if not user_input:
         return ERROR_HANDLER(1423)
 
-    # Check if user_input is a list and combine text if necessary
-    image = False
+    # Handle list content (e.g. vision requests with images)
+    image_paths = []
     if isinstance(user_input, list):
-        image_paths = []
+        combined_text = ''
         for item in user_input:
             if 'text' in item:
-                combined_text = '\n'.join(item['text'])
+                combined_text += item['text'] + '\n'
             try:
                 if 'image_url' in item:
                     if request_data.get('model', 'mistral-nemo') not in vision_supported_models:
@@ -311,47 +281,46 @@ def conversation():
                         binary_data = base64.b64decode(base64_image)
                     else:
                         binary_data = requests.get(item['image_url']['url'])
-                        binary_data.raise_for_status()  # Raise an error for bad responses
+                        binary_data.raise_for_status()
                         binary_data = BytesIO(binary_data.content)
                     files = {
                         'asset': ("relay" + str(uuid.uuid4()), binary_data, 'image/png')
                     }
                     asset = requests.post(ONE_MIN_ASSET_URL, files=files, headers=headers)
-                    asset.raise_for_status()  # Raise an error for bad responses
+                    asset.raise_for_status()
                     image_path = asset.json()['fileContent']['path']
                     image_paths.append(image_path)
                     image = True
             except Exception as e:
                 print(f"An error occurred e:" + str(e)[:60])
-                # Optionally log the error or return an appropriate response
+        user_input = combined_text.strip()
+    else:
+        image = False
 
-        user_input = str(combined_text)
-
-    prompt_token = calculate_token(str(all_messages))
+    prompt_token = calculate_token(str(messages))
     if PERMIT_MODELS_FROM_SUBSET_ONLY and request_data.get('model', 'mistral-nemo') not in AVAILABLE_MODELS:
         return ERROR_HANDLER(1002, request_data.get('model', 'mistral-nemo')) # Handle invalid model
     
     logger.debug(f"Proccessing {prompt_token} prompt tokens with model {request_data.get('model', 'mistral-nemo')}")
 
-    if not image:
-        payload = {
-            "type": "CHAT_WITH_AI",
-            "model": request_data.get('model', 'mistral-nemo'),
-            "promptObject": {
-                "prompt": all_messages,
-                "isMixed": False,
-                "webSearch": False
+    payload = {
+        "type": "UNIFY_CHAT_WITH_AI",
+        "model": request_data.get('model', 'mistral-nemo'),
+        "promptObject": {
+            "prompt": user_input,
+            "settings": {
+                "historySettings": {
+                    "isMixed": False
+                },
+                "webSearchSettings": {
+                    "webSearch": False
+                }
             }
         }
-    else:
-        payload = {
-            "type": "CHAT_WITH_IMAGE",
-            "model": request_data.get('model', 'mistral-nemo'),
-            "promptObject": {
-                "prompt": all_messages,
-                "isMixed": False,
-                "imageList": image_paths
-            }
+    }
+    if image:
+        payload["promptObject"]["attachments"] = {
+            "images": image_paths
         }
     
     headers = {"API-KEY": api_key, 'Content-Type': 'application/json'}
@@ -359,10 +328,11 @@ def conversation():
     if not request_data.get('stream', False):
         # Non-Streaming Response
         logger.debug("Non-Streaming AI Response")
-        response = requests.post(ONE_MIN_API_URL, json=payload, headers=headers)
+        response = requests.post(ONE_MIN_CHAT_API_URL, json=payload, headers=headers)
         response.raise_for_status()
         one_min_response = response.json()
-        
+        logger.debug(f"1min.ai API response: {json.dumps(one_min_response, indent=2, ensure_ascii=False)}")
+
         transformed_response = transform_response(one_min_response, request_data, prompt_token)
         response = make_response(jsonify(transformed_response))
         set_response_headers(response)
@@ -372,7 +342,7 @@ def conversation():
     else:
         # Streaming Response
         logger.debug("Streaming AI Response")
-        response_stream = requests.post(ONE_MIN_CONVERSATION_API_STREAMING_URL, data=json.dumps(payload), headers=headers, stream=True)
+        response_stream = requests.post(ONE_MIN_CHAT_API_STREAMING_URL, data=json.dumps(payload), headers=headers, stream=True)
         if response_stream.status_code != 200:
             if response_stream.status_code == 401:
                 return ERROR_HANDLER(1020)
@@ -420,7 +390,7 @@ def generate_images():
 
     try:
         logger.debug("Image Generation Requested.")
-        response = requests.post(ONE_MIN_API_URL + "?isStreaming=false", json=payload, headers=headers)
+        response = requests.post(ONE_MIN_FEATURES_API_URL, json=payload, headers=headers)
         response.raise_for_status()
         one_min_response = response.json()
 
@@ -476,32 +446,60 @@ def set_response_headers(response):
 
 def stream_response(response, request_data, model, prompt_tokens):
     all_chunks = ""
-    for chunk in response.iter_content(chunk_size=1024):
-        finish_reason = None
+    current_event = None
 
-        return_chunk = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": request_data.get('model', 'mistral-nemo'),
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "content": chunk.decode('utf-8')
-                    },
-                    "finish_reason": finish_reason
+    for line in response.iter_lines(decode_unicode=False):
+        if not line:
+            current_event = None
+            continue
+
+        line = line.decode('utf-8')
+
+        if line.startswith("event: "):
+            current_event = line[7:]
+            continue
+
+        if line.startswith("data: "):
+            data_str = line[6:]
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            logger.debug(f"SSE event={current_event} data={data_str[:200]}")
+
+            if current_event == "content":
+                content = data.get("content", "")
+                all_chunks += content
+                return_chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4()}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request_data.get('model', 'mistral-nemo'),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": content
+                            },
+                            "finish_reason": None
+                        }
+                    ]
                 }
-            ]
-        }
-        all_chunks += chunk.decode('utf-8')
-        yield f"data: {json.dumps(return_chunk)}\n\n"
-        
+                yield f"data: {json.dumps(return_chunk)}\n\n"
+
+            elif current_event == "result":
+                logger.debug(f"SSE result: {json.dumps(data, indent=2, ensure_ascii=False)}")
+
+            elif current_event == "error":
+                logger.error(f"Stream error: {data}")
+                break
+
     tokens = calculate_token(all_chunks)
     logger.debug(f"Finished processing streaming response. Completion tokens: {str(tokens)}")
     logger.debug(f"Total tokens: {str(tokens + prompt_tokens)}")
-        
-    # Final chunk when iteration stops
+
+    # Final chunk when stream ends
     final_chunk = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion.chunk",
@@ -511,7 +509,7 @@ def stream_response(response, request_data, model, prompt_tokens):
             {
                 "index": 0,
                 "delta": {
-                    "content": ""    
+                    "content": ""
                 },
                 "finish_reason": "stop"
             }
